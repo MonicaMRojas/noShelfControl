@@ -1,0 +1,279 @@
+rules_version = '2';
+
+// ============================================================
+// REGLAS DE FIRESTORE — No Shelf Control
+// ============================================================
+// - Cualquier integrante autenticada puede LEER perfiles, libros,
+//   reseñas y propuestas (es una biblioteca privada del club).
+// - Cada usuaria solo crea/edita su propio perfil y sus propias
+//   reseñas, y no puede asignarse el rol de administradora.
+// - Solo las administradoras gestionan libros, rondas de propuestas
+//   y roles de otras integrantes.
+// - Propuestas: máximo 5 por usuaria y ronda, sin libros duplicados
+//   dentro de la ronda y solo mientras la ronda está abierta (la hora
+//   la pone el servidor, no el navegador).
+// - Cualquier colección no listada aquí está denegada.
+// ============================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    function isAdmin() {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    // La foto de perfil y la portada del libro pueden guardarse como Data URL
+    // directamente en el documento (no hay Storage), así que limitamos su
+    // tamaño aquí como red de seguridad además de la compresión del cliente.
+    function validPhoto() {
+      return !('photoURL' in request.resource.data) ||
+        (request.resource.data.photoURL is string && request.resource.data.photoURL.size() < 300000);
+    }
+
+    function validCover() {
+      return !('coverURL' in request.resource.data) ||
+        (request.resource.data.coverURL is string && request.resource.data.coverURL.size() < 500000);
+    }
+
+    function validProfileText() {
+      let data = request.resource.data;
+      return data.name is string && data.name.size() > 0 && data.name.size() <= 40
+        && data.surname is string && data.surname.size() > 0 && data.surname.size() <= 60
+        && (!('quote' in data) || (data.quote is string && data.quote.size() <= 120))
+        && (!('favoriteGenre' in data) || (data.favoriteGenre is string && data.favoriteGenre.size() <= 40));
+    }
+
+    // Progreso de lectura y reseña: se valida aquí además de en el cliente,
+    // para que nadie pueda guardar valores fuera de rango escribiendo
+    // directamente en la base de datos.
+    function validReviewFields() {
+      let data = request.resource.data;
+      return (!('progressPercentage' in data) ||
+          (data.progressPercentage is number &&
+            data.progressPercentage >= 0 && data.progressPercentage <= 100))
+        && (!('progressType' in data) ||
+          data.progressType in ['percentage', 'page'])
+        && (!('currentPage' in data) ||
+          data.currentPage == null ||
+          (data.currentPage is number && data.currentPage >= 0))
+        && (!('totalPages' in data) ||
+          data.totalPages == null ||
+          (data.totalPages is number && data.totalPages > 0))
+        && (!('readingStatus' in data) ||
+          data.readingStatus in ['pendiente', 'leyendo', 'leido'])
+        && (!('rating' in data) ||
+          data.rating == null ||
+          (data.rating is number && data.rating >= 0 && data.rating <= 5))
+        && (!('comment' in data) ||
+          data.comment == null ||
+          (data.comment is string && data.comment.size() <= 600));
+    }
+
+    // ---- Propuestas de lectura ----
+
+    function roundOf(roundId) {
+      return get(/databases/$(database)/documents/proposalRounds/$(roundId)).data;
+    }
+
+    function roundAfter(roundId) {
+      return getAfter(/databases/$(database)/documents/proposalRounds/$(roundId)).data;
+    }
+
+    // ¿La ronda admite propuestas AHORA (hora del servidor)? Abierta, ya
+    // pasada su fecha de apertura y todavía no vencida su fecha de cierre.
+    // Si venció y nadie ha hecho el sorteo, queda bloqueada igualmente.
+    function roundAcceptsProposals(round) {
+      return round.status == 'open'
+        && (round.get('opensAt', null) == null || request.time >= round.opensAt)
+        && request.time < round.closesAt;
+    }
+
+    // Apertura automática: la ronda del libro actual la puede crear cualquier
+    // integrante al entrar (no hay Cloud Functions), pero solo con la forma
+    // exacta "recién abierta ahora mismo, vacía, sin ganador, 7 días", para
+    // el libro actual del club, con la apertura automática activada y una vez
+    // alcanzada su fecha de reunión (con 1 día de margen por zonas horarias).
+    function isValidAutoRoundCreate(roundId) {
+      let data = request.resource.data;
+      let book = get(/databases/$(database)/documents/books/$(roundId)).data;
+      let parts = book.meetingDate.split('-');
+      return data.keys().hasOnly(['sourceBookId', 'sourceMeetingDate', 'title', 'opensAt', 'openedAt',
+          'closesAt', 'status', 'visible', 'winnerProposalId', 'winnerBookTitle', 'winnerBookAuthor',
+          'proposalCounts', 'addedToLibrary', 'createdAt', 'closedAt', 'createdBy'])
+        && roundId == data.sourceBookId
+        && book.status == 'leyendo_ahora'
+        && book.get('autoProposals', false) == true
+        && request.time >= timestamp.date(int(parts[0]), int(parts[1]), int(parts[2])) - duration.value(1, 'd')
+        && data.sourceMeetingDate == book.meetingDate
+        && data.title == ''
+        && data.status == 'open'
+        && data.visible == true
+        && data.winnerProposalId == null
+        && data.winnerBookTitle == null
+        && data.winnerBookAuthor == null
+        && data.addedToLibrary == false
+        && data.closedAt == null
+        && data.createdBy == 'auto'
+        && data.proposalCounts.size() == 0
+        && data.opensAt == request.time
+        && data.openedAt == request.time
+        && data.createdAt == request.time
+        && data.closesAt > request.time + duration.value(6, 'd')
+        && data.closesAt < request.time + duration.value(8, 'd');
+    }
+
+    // Al borrar su propia propuesta, una usuaria también decrementa el
+    // contador de esa ronda (proposalCounts.{uid}) en la misma transacción:
+    // solo puede tocar SU propia entrada, y solo para bajarla.
+    function isOwnCounterDecrement() {
+      let uid = request.auth.uid;
+      let before = resource.data.proposalCounts;
+      let after = request.resource.data.proposalCounts;
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(['proposalCounts'])
+        && (uid in before) && (uid in after)
+        && after[uid] >= 0
+        && after[uid] < before[uid]
+        && before.diff(after).affectedKeys().hasOnly([uid]);
+    }
+
+    // Al proponer un libro, la usuaria también incrementa en la misma
+    // transacción el contador de esa ronda: solo puede subir SU propia
+    // entrada en exactamente 1, sin pasar de 5 y con la ronda abierta.
+    function isOwnCounterIncrement() {
+      let uid = request.auth.uid;
+      let before = resource.data.proposalCounts;
+      let after = request.resource.data.proposalCounts;
+      let beforeVal = (uid in before) ? before[uid] : 0;
+      let afterVal = (uid in after) ? after[uid] : 0;
+      return roundAcceptsProposals(resource.data)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['proposalCounts'])
+        && after.diff(before).affectedKeys().hasOnly([uid])
+        && afterVal == beforeVal + 1
+        && afterVal <= 5;
+    }
+
+    // Crear una propuesta: máximo 5 por usuaria y ronda, ronda abierta, ID
+    // del documento = roundId + título normalizado + autor normalizado (así
+    // dos propuestas del mismo libro chocan en el mismo documento y la
+    // segunda se rechaza), y el contador de la ronda debe subir 1 en la
+    // misma escritura (getAfter), así que no se puede saltar el límite
+    // creando documentos sin pasar por el contador.
+    function canCreateProposal(proposalId) {
+      let data = request.resource.data;
+      let uid = request.auth.uid;
+      let round = roundOf(data.roundId);
+      let counts = round.get('proposalCounts', {});
+      let count = (uid in counts) ? counts[uid] : 0;
+      return data.keys().hasOnly(['roundId', 'userId', 'title', 'author', 'genre',
+          'normalizedTitle', 'normalizedAuthor', 'createdAt'])
+        && data.userId == uid
+        && data.roundId is string
+        && data.title is string && data.title.size() > 0 && data.title.size() <= 200
+        && data.author is string && data.author.size() > 0 && data.author.size() <= 200
+        && data.normalizedTitle is string && data.normalizedTitle.size() > 0 && data.normalizedTitle.size() <= 300
+        && data.normalizedAuthor is string && data.normalizedAuthor.size() > 0 && data.normalizedAuthor.size() <= 300
+        && (data.genre == null || (data.genre is string && data.genre.size() <= 60))
+        && data.createdAt == request.time
+        && proposalId == data.roundId + '_' + data.normalizedTitle + '_' + data.normalizedAuthor
+        && roundAcceptsProposals(round)
+        && count < 5
+        && roundAfter(data.roundId).proposalCounts[uid] == count + 1;
+    }
+
+    function canDeleteOwnProposal() {
+      return resource.data.userId == request.auth.uid
+        && roundAcceptsProposals(roundOf(resource.data.roundId));
+    }
+
+    // ---------------- users ----------------
+    match /users/{uid} {
+      allow read: if isSignedIn();
+
+      // Al crear su perfil, una usuaria solo puede asignarse el rol "member".
+      allow create: if isOwner(uid) && request.resource.data.role == 'member'
+        && validPhoto() && validProfileText();
+
+      // Al editar su perfil, no puede cambiar su propio rol (evita
+      // auto-ascender a admin).
+      allow update: if (isOwner(uid)
+          && request.resource.data.role == resource.data.role
+          && validPhoto() && validProfileText())
+        // Una administradora puede cambiar SOLO el rol de OTRA integrante.
+        || (isAdmin()
+          && request.auth.uid != uid
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['role'])
+          && request.resource.data.role in ['member', 'admin']);
+
+      allow delete: if false;
+    }
+
+    // ---------------- books ----------------
+    match /books/{bookId} {
+      allow read: if isSignedIn();
+      allow create, update: if isAdmin() && validCover();
+      allow delete: if isAdmin();
+    }
+
+    // ---------------- reviews ----------------
+    match /reviews/{reviewId} {
+      allow read: if isSignedIn();
+
+      // El ID del documento debe ser "{uid}_{bookId}" y el campo userId
+      // debe coincidir con la usuaria autenticada.
+      allow create: if isSignedIn() &&
+        request.resource.data.userId == request.auth.uid &&
+        reviewId == request.auth.uid + '_' + request.resource.data.bookId &&
+        validReviewFields();
+
+      // Ni userId ni bookId pueden cambiar en una actualización.
+      allow update: if isSignedIn() &&
+        resource.data.userId == request.auth.uid &&
+        request.resource.data.userId == request.auth.uid &&
+        request.resource.data.bookId == resource.data.bookId &&
+        validReviewFields();
+
+      allow delete: if isSignedIn() && resource.data.userId == request.auth.uid;
+    }
+
+    // ---------------- proposalRounds ----------------
+    match /proposalRounds/{roundId} {
+      // Lectura abierta a cualquier usuaria autenticada. NO se filtra por
+      // "visible" aquí: las reglas no son filtros y la consulta "última
+      // ronda" sería rechazada. El campo "visible" lo respeta el cliente;
+      // los datos de la ronda no son secretos (las propuestas ya son
+      // legibles por todas).
+      allow read: if isSignedIn();
+
+      allow create: if isAdmin() || (isSignedIn() && isValidAutoRoundCreate(roundId));
+
+      // Cerrar, sortear, reabrir, programar... solo administradoras.
+      // Las integrantes solo pueden mover SU contador al proponer/borrar.
+      allow update: if isAdmin()
+        || (isSignedIn() && isOwnCounterDecrement())
+        || (isSignedIn() && isOwnCounterIncrement());
+
+      allow delete: if isAdmin();
+    }
+
+    // ---------------- bookProposals ----------------
+    match /bookProposals/{proposalId} {
+      allow read: if isSignedIn();
+
+      allow create: if isSignedIn() && canCreateProposal(proposalId);
+
+      allow update: if false;
+
+      allow delete: if isAdmin() || (isSignedIn() && canDeleteOwnProposal());
+    }
+  }
+}

@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240" role="img" aria-label="No Shelf Control">
+  <rect width="240" height="240" rx="56" fill="#D8D8F4"/>
+  <rect x="52" y="132" width="136" height="20" rx="6" fill="#6B6097"/>
+  <rect x="64" y="110" width="112" height="20" rx="6" fill="#A5BFD0"/>
+  <rect x="58" y="88" width="124" height="20" rx="6" fill="#E5B7BC"/>
+  <path d="M170 40l5 11 12 1-9 8 3 12-11-6-11 6 3-12-9-8 12-1z" fill="#FFF1AD"/>
+  <text x="120" y="190" text-anchor="middle" font-family="Georgia, serif" font-size="22" font-weight="bold" fill="#6B6097">No Shelf Control</text>
+</svg>
